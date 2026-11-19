@@ -1,10 +1,15 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <functional>
+#include <future>
 #include <iostream>
+#include <list>
 #include <mutex>
-#include <queue>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -13,40 +18,60 @@
 class ThreadPool
 {
 public:
-  explicit ThreadPool(size_t count);
+  using Task = std::function< void() >;
+
+  explicit ThreadPool(std::size_t threadCount, std::size_t batchSize = defaultBatchSize_);
   ~ThreadPool();
 
-  void submit(std::function< void() > task);
-  void wait();
+  void submit(Task task);
   void pause();
   void resume();
+  void wait();
 
 private:
-  std::queue< std::function< void() > > tasks_;
-  std::vector< std::thread > threads_;
-  std::mutex mutex_;
-  std::condition_variable ready_;
-  std::condition_variable finished_;
+  using RWLock = std::shared_timed_mutex;
+
+  struct TaskQueue
+  {
+    std::list< Task > tasks;
+    RWLock mutex;
+  };
+
+  static constexpr std::size_t defaultBatchSize_ = 4;
+  TaskQueue globalQueue_;
+  std::vector< TaskQueue > localQueues_;
+  const std::size_t batchSize_;
+  RWLock stateMutex_;
+  std::condition_variable_any ready_;
+  std::condition_variable_any finished_;
+  std::atomic< std::size_t > queued_{0};
+  std::size_t outstanding_ = 0;
   bool stopped_ = false;
   bool paused_ = false;
-  size_t active_ = 0;
+  std::vector< std::thread > threads_;
 
-  void execute();
+  bool tryTakeTask(TaskQueue& local, Task& task);
+  bool tryTakeBatch(TaskQueue& source, TaskQueue& local, Task& task, bool steal);
+  void execute(std::size_t worker);
   void stop();
 };
 
-ThreadPool::ThreadPool(size_t count)
+ThreadPool::ThreadPool(std::size_t threadCount, std::size_t batchSize):
+  localQueues_(threadCount),
+  batchSize_(batchSize)
 {
-  if (count == 0)
+  if ((threadCount == 0) || (batchSize == 0))
   {
-    throw std::invalid_argument("Thread count must be positive");
+    throw std::invalid_argument("Thread count and batch size must be positive");
   }
+
+  threads_.reserve(threadCount);
 
   try
   {
-    for (size_t i = 0; i < count; ++i)
+    for (std::size_t i = 0; i < threadCount; ++i)
     {
-      threads_.emplace_back(&ThreadPool::execute, this);
+      threads_.emplace_back(&ThreadPool::execute, this, i);
     }
   }
   catch (...)
@@ -61,17 +86,20 @@ ThreadPool::~ThreadPool()
   stop();
 }
 
-void ThreadPool::submit(std::function< void() > task)
+void ThreadPool::submit(Task task)
 {
   {
-    std::lock_guard< std::mutex > lock(mutex_);
+    std::unique_lock< RWLock > lock(stateMutex_);
 
     if (stopped_)
     {
       throw std::logic_error("Thread pool is stopped");
     }
 
-    tasks_.push(std::move(task));
+    std::unique_lock< RWLock > queueLock(globalQueue_.mutex);
+    globalQueue_.tasks.push_back(std::move(task));
+    ++queued_;
+    ++outstanding_;
   }
 
   ready_.notify_one();
@@ -79,14 +107,14 @@ void ThreadPool::submit(std::function< void() > task)
 
 void ThreadPool::pause()
 {
-  std::lock_guard< std::mutex > lock(mutex_);
+  std::unique_lock< RWLock > lock(stateMutex_);
   paused_ = true;
 }
 
 void ThreadPool::resume()
 {
   {
-    std::lock_guard< std::mutex > lock(mutex_);
+    std::unique_lock< RWLock > lock(stateMutex_);
     paused_ = false;
   }
 
@@ -95,34 +123,121 @@ void ThreadPool::resume()
 
 void ThreadPool::wait()
 {
-  std::unique_lock< std::mutex > lock(mutex_);
+  std::shared_lock< RWLock > lock(stateMutex_);
+
   finished_.wait(lock, [this]()
   {
-    return tasks_.empty() && (active_ == 0);
+    return outstanding_ == 0;
   });
 }
 
-void ThreadPool::execute()
+bool ThreadPool::tryTakeTask(TaskQueue& local, Task& task)
 {
+  {
+    std::unique_lock< RWLock > lock(local.mutex);
+
+    if (!local.tasks.empty())
+    {
+      task = std::move(local.tasks.front());
+      local.tasks.pop_front();
+      return true;
+    }
+  }
+
+  if (tryTakeBatch(globalQueue_, local, task, false))
+  {
+    return true;
+  }
+
+  for (TaskQueue& source : localQueues_)
+  {
+    if ((&source != &local) && tryTakeBatch(source, local, task, true))
+    {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool ThreadPool::tryTakeBatch(TaskQueue& source, TaskQueue& local, Task& task, bool steal)
+{
+  {
+    std::shared_lock< RWLock > lock(source.mutex);
+
+    if (source.tasks.empty())
+    {
+      return false;
+    }
+  }
+
+  std::unique_lock< RWLock > sourceLock(source.mutex, std::defer_lock);
+  std::unique_lock< RWLock > localLock(local.mutex, std::defer_lock);
+  std::lock(sourceLock, localLock);
+
+  if (source.tasks.empty())
+  {
+    return false;
+  }
+
+  if (steal)
+  {
+    const std::size_t size = source.tasks.size();
+    const std::size_t count = size - size / 2;
+    auto begin = source.tasks.end();
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      --begin;
+    }
+
+    local.tasks.splice(local.tasks.end(), source.tasks, begin, source.tasks.end());
+  }
+  else
+  {
+    const std::size_t count = std::min(batchSize_, source.tasks.size());
+    auto end = source.tasks.begin();
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      ++end;
+    }
+
+    local.tasks.splice(local.tasks.end(), source.tasks, source.tasks.begin(), end);
+  }
+
+  task = std::move(local.tasks.front());
+  local.tasks.pop_front();
+  return true;
+}
+
+void ThreadPool::execute(std::size_t worker)
+{
+  TaskQueue& local = localQueues_[worker];
+
   while (true)
   {
-    std::function< void() > task;
+    Task task;
 
     {
-      std::unique_lock< std::mutex > lock(mutex_);
+      std::shared_lock< RWLock > lock(stateMutex_);
+
       ready_.wait(lock, [this]()
       {
-        return stopped_ || (!paused_ && !tasks_.empty());
+        return stopped_ || (!paused_ && (queued_ != 0));
       });
 
-      if (stopped_ && tasks_.empty())
+      if (stopped_ && (queued_ == 0))
       {
         return;
       }
 
-      task = std::move(tasks_.front());
-      tasks_.pop();
-      ++active_;
+      if (!tryTakeTask(local, task))
+      {
+        continue;
+      }
+
+      --queued_;
     }
 
     try
@@ -138,11 +253,13 @@ void ThreadPool::execute()
       std::cerr << "Task failed: unknown exception\n";
     }
 
-    {
-      std::lock_guard< std::mutex > lock(mutex_);
-      --active_;
+    task = nullptr;
 
-      if (tasks_.empty() && (active_ == 0))
+    {
+      std::unique_lock< RWLock > lock(stateMutex_);
+      --outstanding_;
+
+      if (outstanding_ == 0)
       {
         finished_.notify_all();
       }
@@ -153,9 +270,8 @@ void ThreadPool::execute()
 void ThreadPool::stop()
 {
   {
-    std::lock_guard< std::mutex > lock(mutex_);
+    std::unique_lock< RWLock > lock(stateMutex_);
     stopped_ = true;
-    paused_ = false;
   }
 
   ready_.notify_all();
@@ -168,28 +284,56 @@ void ThreadPool::stop()
 
 int main()
 {
-  const size_t threadCount = 3;
-  const size_t taskCount = 10;
-  std::vector< size_t > results(taskCount);
-  ThreadPool pool(threadCount);
+  const std::size_t threadCount = 2;
+  const std::vector< int > durations{180, 25, 50, 75};
+  const std::size_t lastTask = durations.size() - 1;
+  const std::chrono::seconds timeout(5);
+  const auto releaseTimeout = timeout + timeout;
+  std::vector< std::thread::id > taskThreads(durations.size());
+  std::promise< void > releaseLongTask;
+  const auto release = releaseLongTask.get_future().share();
+  std::promise< void > shortTaskDone;
+  auto shortResult = shortTaskDone.get_future();
+  ThreadPool pool(threadCount, durations.size());
 
   pool.pause();
 
-  for (size_t i = 0; i < taskCount; ++i)
+  for (std::size_t i = 0; i < durations.size(); ++i)
   {
-    pool.submit([&results, i]()
+    pool.submit([&, i]()
     {
-      results[i] = i * i;
+      taskThreads[i] = std::this_thread::get_id();
+      std::this_thread::sleep_for(std::chrono::milliseconds(durations[i]));
+
+      if (i == 0)
+      {
+        release.wait_for(releaseTimeout);
+      }
+
+      if (i == lastTask)
+      {
+        shortTaskDone.set_value();
+      }
     });
   }
 
   pool.resume();
+
+  const bool shortFinished = shortResult.wait_for(timeout) == std::future_status::ready;
+  releaseLongTask.set_value();
   pool.wait();
 
-  for (size_t result : results)
+  for (std::size_t i = 0; i < durations.size(); ++i)
   {
-    std::cout << result << '\n';
+    std::cout << "Task " << i << ": " << durations[i] << " ms, thread " << taskThreads[i] << '\n';
   }
 
+  if (!shortFinished || (taskThreads[0] == taskThreads[lastTask]))
+  {
+    std::cerr << "Work stealing test failed\n";
+    return 1;
+  }
+
+  std::cout << "Work stealing test passed\n";
   return 0;
 }
